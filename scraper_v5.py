@@ -64,6 +64,7 @@ HEADERS = {
 # Each query targets Nigerian news specifically.
 # Google News RSS returns ~10 results per query, refreshed every few hours.
 SEARCH_QUERIES = [
+    # ── General Nigeria ───────────────────────────────────────────────────────
     "arrested Nigeria",
     "detained Nigeria",
     "missing person Nigeria",
@@ -72,6 +73,8 @@ SEARCH_QUERIES = [
     "remanded custody Nigeria",
     "DSS custody Nigeria",
     "disappeared Nigeria",
+    "has been missing Nigeria",
+    "taken into custody Nigeria",
     "EndSARS arrested",
     "EndSARS missing",
     "EndSARS detained",
@@ -79,11 +82,145 @@ SEARCH_QUERIES = [
     "activist detained Nigeria",
     "journalist arrested Nigeria",
     "police arrest Nigeria",
-    "missing Nigeria Lagos",
-    "missing Nigeria Abuja",
-    "missing Nigeria Kano",
-    "kidnapped Nigeria Borno",
     "arrested Nigeria human rights",
+    "taken by soldiers Nigeria",
+    "taken by police Nigeria",
+
+    # ── Lagos ─────────────────────────────────────────────────────────────────
+    "taken Lagos",
+    "missing person Lagos",
+    "arrested Lagos",
+    "kidnapped Lagos",
+    "detained Lagos",
+    "disappeared Lagos",
+
+    # ── Kano ─────────────────────────────────────────────────────────────────
+    "taken Kano",
+    "missing person Kano",
+    "arrested Kano",
+    "kidnapped Kano",
+    "detained Kano",
+
+    # ── Ibadan ───────────────────────────────────────────────────────────────
+    "taken Ibadan",
+    "missing person Ibadan",
+    "arrested Ibadan",
+    "kidnapped Ibadan",
+
+    # ── Abuja ─────────────────────────────────────────────────────────────────
+    "taken Abuja",
+    "missing person Abuja",
+    "arrested Abuja",
+    "detained Abuja FCT",
+    "kidnapped Abuja",
+
+    # ── Port Harcourt ─────────────────────────────────────────────────────────
+    "taken Port Harcourt",
+    "missing person Port Harcourt",
+    "arrested Port Harcourt",
+    "kidnapped Port Harcourt",
+
+    # ── Benin City ────────────────────────────────────────────────────────────
+    "taken Benin City",
+    "missing person Benin City",
+    "arrested Benin City",
+    "kidnapped Benin City",
+
+    # ── Kaduna ────────────────────────────────────────────────────────────────
+    "taken Kaduna",
+    "missing person Kaduna",
+    "arrested Kaduna",
+    "kidnapped Kaduna",
+
+    # ── Enugu ─────────────────────────────────────────────────────────────────
+    "taken Enugu",
+    "missing person Enugu",
+    "arrested Enugu",
+    "kidnapped Enugu",
+
+    # ── Aba ───────────────────────────────────────────────────────────────────
+    "taken Aba Nigeria",
+    "missing person Aba Nigeria",
+    "arrested Aba Nigeria",
+    "kidnapped Aba Nigeria",
+
+    # ── Maiduguri ─────────────────────────────────────────────────────────────
+    "taken Maiduguri",
+    "missing person Maiduguri",
+    "arrested Maiduguri",
+    "kidnapped Maiduguri",
+
+    # ── States ────────────────────────────────────────────────────────────────
+    "arrested Rivers State",
+    "kidnapped Rivers State",
+    "missing Rivers State",
+    "arrested Delta State",
+    "kidnapped Delta State",
+    "arrested Ogun State",
+    "missing Ogun State",
+    "arrested Oyo State",
+    "missing Oyo State",
+    "kidnapped Oyo State",
+    "arrested Anambra",
+    "missing Anambra",
+    "kidnapped Anambra",
+    "arrested Imo State",
+    "missing Imo State",
+    "arrested Edo State",
+    "missing Edo State",
+    "kidnapped Edo State",
+    "arrested Borno",
+    "missing Borno",
+    "kidnapped Borno",
+    "arrested Zamfara",
+    "kidnapped Zamfara",
+    "missing Zamfara",
+    "arrested Sokoto",
+    "kidnapped Sokoto",
+    "arrested Kebbi",
+    "kidnapped Kebbi",
+    "arrested Katsina",
+    "kidnapped Katsina",
+    "missing Katsina",
+    "arrested Bauchi",
+    "kidnapped Bauchi",
+    "arrested Gombe",
+    "missing Gombe",
+    "arrested Adamawa",
+    "missing Adamawa",
+    "arrested Taraba",
+    "kidnapped Taraba",
+    "arrested Benue",
+    "kidnapped Benue",
+    "missing Benue",
+    "arrested Plateau",
+    "kidnapped Plateau",
+    "missing Plateau",
+    "arrested Nasarawa",
+    "arrested Niger State",
+    "kidnapped Niger State",
+    "arrested Kwara",
+    "missing Kwara",
+    "arrested Ekiti",
+    "arrested Ondo State",
+    "missing Ondo State",
+    "arrested Osun",
+    "missing Osun",
+    "arrested Cross River",
+    "missing Cross River",
+    "arrested Akwa Ibom",
+    "missing Akwa Ibom",
+    "arrested Bayelsa",
+    "missing Bayelsa",
+    "kidnapped Bayelsa",
+    "arrested Ebonyi",
+    "missing Ebonyi",
+    "arrested Abia",
+    "missing Abia",
+    "arrested Jigawa",
+    "missing Jigawa",
+    "arrested Yobe",
+    "missing Yobe",
 ]
 
 # Trusted Nigerian news domains — articles from other domains are skipped
@@ -185,24 +322,35 @@ def google_news_urls(query: str, cutoff: datetime) -> List[tuple]:
 
     results = []
     for item in soup.find_all("item"):
-        # Get URL - Google News wraps the real URL, find it in <link> or <guid>
-        link = item.find("link")
-        if not link:
+        # In Google News RSS, <link> is a self-closing tag in XML mode.
+        # The actual URL is stored as the text of <guid> or as the
+        # NavigableString sibling of <link>. Try multiple approaches.
+        url = ""
+
+        # Approach 1: guid contains the Google News article URL
+        guid = item.find("guid")
+        if guid:
+            url = guid.get_text().strip()
+
+        # Approach 2: link tag text (works in some parsers)
+        if not url:
+            link = item.find("link")
+            if link and link.string:
+                url = link.string.strip()
+
+        # Approach 3: next sibling of <link> tag (BeautifulSoup XML quirk)
+        if not url:
+            link = item.find("link")
+            if link and link.next_sibling:
+                candidate = str(link.next_sibling).strip()
+                if candidate.startswith("http"):
+                    url = candidate
+
+        if not url:
             continue
 
-        # Google News RSS <link> is a Google redirect URL
-        # The real URL is in the <source url="..."> or we can follow the redirect
-        url = link.get_text().strip() if link.string else ""
-        if not url:
-            # Try next sibling text
-            url = item.find("guid")
-            url = url.get_text().strip() if url else ""
-
-        if not url or "google.com" not in url:
-            # Already a direct URL
-            pass
-        else:
-            # Follow Google redirect to get real URL
+        # Follow Google redirect to get the real article URL
+        if "google.com" in url:
             try:
                 r = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
                                 allow_redirects=True)
@@ -332,7 +480,8 @@ def scrape_article(url: str, source_name: str, pub_date: Optional[datetime]) -> 
     combined_lower = (title + " " + body[:500]).lower()
     relevance_words = [
         "arrested", "detained", "missing", "abducted", "kidnapped",
-        "disappeared", "remanded", "custody", "endsars", "whereabouts"
+        "disappeared", "remanded", "custody", "endsars", "whereabouts",
+        "has been missing", "taken by", "taken into custody"
     ]
     if not any(w in combined_lower for w in relevance_words):
         return []
