@@ -2,8 +2,17 @@ name: Daily Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # 7am WAT every day
   workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'Run in backfill mode (10 years)?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   scrape:
@@ -11,13 +20,22 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests beautifulsoup4 supabase python-dotenv anthropic
-      - name: Run daily scraper
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml supabase python-dotenv anthropic
+
+      - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scraper_v4.py
+        run: |
+          if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
+            python scraper_v5.py --backfill
+          else
+            python scraper_v5.py
+          fi
