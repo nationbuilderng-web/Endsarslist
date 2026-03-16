@@ -1,62 +1,69 @@
 #!/usr/bin/env python3
 """
-EndSARSList — Scraper v3 (Backfill + Daily)
-=============================================
-Two modes:
-  python scraper_v3.py            # daily mode — last 2 days only
-  python scraper_v3.py --backfill # backfill mode — goes back 10 years
+EndSARSList — Scraper v4
+=========================
+Improvements over v3:
+  - Claude API for name/entity extraction (no more regex garbage)
+  - Batch URL deduplication (one DB call instead of one per article)
+  - Unknown-date articles no longer auto-pass cutoff
+  - TikTok title search via unofficial API
+  - Facebook public page scraping
+  - Single workflow (delete the duplicate "EndSARSList Daily Scraper")
+  - Backfill works correctly with proper date gating
 
-How it works:
-  - Searches each news site using their own search endpoint for each keyword
-  - Paginates through ALL results (not just homepage)
-  - Extracts article publish date → maps to date_missing / date_arrested
-  - Deduplicates by source_url
-  - All records go live immediately (is_approved=True)
+Two modes:
+  python scraper_v4.py            # daily mode — last 2 days
+  python scraper_v4.py --backfill # backfill mode — last 10 years
 
 Setup:
-  pip install requests beautifulsoup4 supabase python-dotenv
+  pip install requests beautifulsoup4 supabase python-dotenv anthropic
 
 Env vars:
-  SUPABASE_URL=https://your-project.supabase.co
-  SUPABASE_SERVICE_KEY=your-service-role-key
+  SUPABASE_URL
+  SUPABASE_SERVICE_KEY
+  ANTHROPIC_API_KEY         ← new
 """
 
-import os, re, time, logging, hashlib, sys, argparse
+import os, re, time, logging, sys, argparse, json
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
-from urllib.parse import urljoin, urlencode, quote_plus
+from dataclasses import dataclass, field
+from typing import Optional, List
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import anthropic
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
+# ── Clients ───────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BACKFILL_YEARS = 10
-DAILY_DAYS = 2        # look back 2 days in daily mode (catches anything missed yesterday)
-MAX_PAGES = 50        # max search result pages per keyword per source
-REQUEST_DELAY = 1.0   # seconds between requests (be polite)
-TIMEOUT = 15
+BACKFILL_YEARS  = 10
+DAILY_DAYS      = 2
+MAX_PAGES_DAILY = 3
+MAX_PAGES_BACK  = 50
+REQUEST_DELAY   = 1.2   # seconds between HTTP requests
+TIMEOUT         = 15
+CLAUDE_MODEL    = "claude-haiku-4-5-20251001"   # fast + cheap for extraction
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; EndSARSListBot/3.0; +https://endsarslist.com)",
-    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
 }
 
-# ── Search keywords ───────────────────────────────────────────────────────────
-# These are sent to each site's search engine
 SEARCH_TERMS = [
     "arrested Nigeria",
     "detained Nigeria",
@@ -65,7 +72,6 @@ SEARCH_TERMS = [
     "kidnapped Nigeria",
     "remanded custody Nigeria",
     "DSS custody Nigeria",
-    "police arrest Nigeria",
     "disappeared Nigeria",
     "EndSARS arrested",
     "EndSARS missing",
@@ -73,27 +79,6 @@ SEARCH_TERMS = [
     "protester arrested Nigeria",
     "activist detained Nigeria",
     "journalist arrested Nigeria",
-]
-
-# Article-level keywords for classification
-ARRESTED_KEYWORDS = [
-    "arrested","detained","remanded","arraigned","charged to court",
-    "in custody","police custody","DSS custody","military custody",
-    "EFCC custody","army custody","grabbed","nabbed","apprehended",
-    "picked up by police","picked up by DSS","taken into custody",
-    "handed over to police","handed over to DSS","surrendered to police",
-    "voluntarily surrendered","turned himself in","turned herself in",
-    "bail denied","held without trial","locked up","behind bars",
-    "protester arrested","activist arrested","journalist arrested",
-    "blogger arrested","EndSARS arrest","detained activist",
-]
-
-MISSING_KEYWORDS = [
-    "missing","gone missing","last seen","whereabouts unknown",
-    "disappeared","cannot be found","help find","missing since",
-    "unaccounted for","abducted","kidnapped","missing person",
-    "forcibly disappeared","taken away","whereabouts",
-    "has not returned","not been seen","cannot be reached",
 ]
 
 NIGERIAN_STATES = [
@@ -104,17 +89,8 @@ NIGERIAN_STATES = [
     "Zamfara","FCT","Abuja","Port Harcourt","Ibadan","Benin City",
 ]
 
-AUTHORITIES = [
-    "police","DSS","SSS","army","military","EFCC","ICPC","NSCDC",
-    "immigration","customs","soldiers","naval","air force",
-]
-
-# ── Source definitions ────────────────────────────────────────────────────────
-# (name, base_url, search_url_template, result_link_selector, next_page_selector)
-# search_url_template uses {query} and {page}
-
-SOURCES = [
-    # ── Tier 1 national ──
+# ── Sources ───────────────────────────────────────────────────────────────────
+NEWS_SOURCES = [
     {
         "name": "Sahara Reporters",
         "base": "https://saharareporters.com",
@@ -172,14 +148,6 @@ SOURCES = [
         "date_sel": "time, .post-date",
     },
     {
-        "name": "This Day Live",
-        "base": "https://www.thisdaylive.com",
-        "search": "https://www.thisdaylive.com/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
-    },
-    {
         "name": "Daily Post Nigeria",
         "base": "https://dailypost.ng",
         "search": "https://dailypost.ng/?s={query}&paged={page}",
@@ -202,22 +170,6 @@ SOURCES = [
         "link_sel": "a.item__title, h2 a, h3 a",
         "next_sel": "a.next, .pagination a[rel=next]",
         "date_sel": "time, .date, .post-date",
-    },
-    {
-        "name": "Ripples Nigeria",
-        "base": "https://www.ripplesnigeria.com",
-        "search": "https://www.ripplesnigeria.com/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
-    },
-    {
-        "name": "The Whistler",
-        "base": "https://thewhistler.ng",
-        "search": "https://thewhistler.ng/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
     },
     {
         "name": "HumAngle",
@@ -244,22 +196,6 @@ SOURCES = [
         "date_sel": "time, .post-date",
     },
     {
-        "name": "Leadership Nigeria",
-        "base": "https://leadership.ng",
-        "search": "https://leadership.ng/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
-    },
-    {
-        "name": "Nigerian Tribune",
-        "base": "https://tribuneonlineng.com",
-        "search": "https://tribuneonlineng.com/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
-    },
-    {
         "name": "Channels TV",
         "base": "https://www.channelstv.com",
         "search": "https://www.channelstv.com/?s={query}&paged={page}",
@@ -268,39 +204,25 @@ SOURCES = [
         "date_sel": "time, .post-date",
     },
     {
-        "name": "BusinessDay Nigeria",
-        "base": "https://businessday.ng",
-        "search": "https://businessday.ng/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
+        "name": "Ripples Nigeria",
+        "base": "https://www.ripplesnigeria.com",
+        "search": "https://www.ripplesnigeria.com/?s={query}&paged={page}",
+        "link_sel": "h2.entry-title a",
         "next_sel": "a.next",
         "date_sel": "time, .post-date",
-    },
-    {
-        "name": "The Sun Nigeria",
-        "base": "https://www.sunnewsonline.com",
-        "search": "https://www.sunnewsonline.com/?s={query}&paged={page}",
-        "link_sel": "h2.entry-title a, h3 a",
-        "next_sel": "a.next",
-        "date_sel": "time, .post-date",
-    },
-    {
-        "name": "Nairaland Crime",
-        "base": "https://www.nairaland.com",
-        "search": "https://www.nairaland.com/search/posts?q={query}&board=crime&page={page}",
-        "link_sel": "a.post_title, td.subject a",
-        "next_sel": "a[href*='page=']",
-        "date_sel": ".post_time, span[title]",
-    },
-    {
-        "name": "BBC Pidgin",
-        "base": "https://www.bbc.com/pidgin",
-        "search": "https://www.bbc.com/pidgin/search?q={query}&page={page}",
-        "link_sel": "a[href*='/pidgin/']",
-        "next_sel": "a[aria-label='Next Page']",
-        "date_sel": "time",
     },
 ]
 
+# ── Facebook public pages (no login needed) ───────────────────────────────────
+# These are public advocacy/news pages, not private groups.
+FACEBOOK_PAGES = [
+    "SaharaReporters",
+    "PunchNewspaper",
+    "TheGuardianNigeria",
+    "premiumtimesng",
+    "Amnesty.Nigeria",
+    "EndSARSMemorial",
+]
 
 # ── Data model ────────────────────────────────────────────────────────────────
 @dataclass
@@ -308,23 +230,24 @@ class ScrapedPerson:
     full_name: str
     source_url: str
     source_name: str
-    record_type: str
+    record_type: str          # "arrested" | "missing"
     circumstances: str = ""
     last_seen_location: str = ""
     state: str = ""
     age: Optional[int] = None
     gender: str = "unknown"
-    article_date: Optional[str] = None   # ISO date string
+    article_date: Optional[str] = None
     photo_url: str = ""
     charges: str = ""
     holding_location: str = ""
     arresting_authority: str = ""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def fetch(url: str) -> Optional[BeautifulSoup]:
+# ── HTTP helper ───────────────────────────────────────────────────────────────
+def fetch(url: str, extra_headers: dict = None) -> Optional[BeautifulSoup]:
     try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        h = {**HEADERS, **(extra_headers or {})}
+        r = requests.get(url, headers=h, timeout=TIMEOUT)
         r.raise_for_status()
         return BeautifulSoup(r.text, "html.parser")
     except Exception as e:
@@ -332,269 +255,159 @@ def fetch(url: str) -> Optional[BeautifulSoup]:
         return None
 
 
-def already_scraped(url: str) -> bool:
+# ── Batch deduplication (one DB call per batch) ───────────────────────────────
+def filter_already_scraped(urls: List[str]) -> List[str]:
+    """Return only URLs not yet in DB. One query per table instead of one per URL."""
+    if not urls:
+        return []
     try:
-        r1 = supabase.table("arrested_persons").select("id").eq("source_url", url).limit(1).execute()
-        r2 = supabase.table("missing_persons").select("id").eq("source_url", url).limit(1).execute()
-        return bool(r1.data or r2.data)
-    except:
-        return False
+        r1 = supabase.table("arrested_persons").select("source_url").in_("source_url", urls).execute()
+        r2 = supabase.table("missing_persons").select("source_url").in_("source_url", urls).execute()
+        seen = {row["source_url"] for row in (r1.data or []) + (r2.data or [])}
+        return [u for u in urls if u not in seen]
+    except Exception as e:
+        log.warning(f"Dedup check failed: {e}")
+        return urls
 
 
+# ── Date helpers ──────────────────────────────────────────────────────────────
 def parse_date(text: str) -> Optional[str]:
-    """
-    Try to parse a date string into ISO format YYYY-MM-DD.
-    Handles many formats found on Nigerian news sites.
-    """
     if not text:
         return None
-    text = text.strip()
+    text = re.sub(r'\s+', ' ', text.strip())
+    text = re.sub(r'(st|nd|rd|th),', ',', text)
 
     formats = [
-        "%B %d, %Y",       # January 15, 2021
-        "%b %d, %Y",       # Jan 15, 2021
-        "%d %B %Y",        # 15 January 2021
-        "%d %b %Y",        # 15 Jan 2021
-        "%Y-%m-%dT%H:%M:%S%z",  # ISO
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%d-%m-%Y",
-        "%A, %B %d, %Y",   # Monday, January 15, 2021
-        "%A, %d %B %Y",    # Monday, 15 January 2021
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+        "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+        "%A, %B %d, %Y", "%A, %d %B %Y",
     ]
-
-    # Clean up text
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'(st|nd|rd|th),', ',', text)  # remove ordinal suffixes
-
     for fmt in formats:
         try:
-            return datetime.strptime(text[:len(fmt)+5], fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(text[:30], fmt).strftime("%Y-%m-%d")
         except:
             pass
 
-    # Try extracting just a year-month-day pattern
     m = re.search(r'(\d{4})-(\d{2})-(\d{2})', text)
     if m:
         return m.group(0)
-
-    m = re.search(r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', text, re.IGNORECASE)
+    m = re.search(
+        r'(\d{1,2})\s+(January|February|March|April|May|June|July|'
+        r'August|September|October|November|December)\s+(\d{4})',
+        text, re.IGNORECASE
+    )
     if m:
         try:
             return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").strftime("%Y-%m-%d")
         except:
             pass
-
     return None
 
 
 def extract_article_date(soup: BeautifulSoup, date_sel: str) -> Optional[str]:
-    """Extract publish date from article page."""
-    # Try datetime attribute first (most reliable)
     for tag in soup.find_all("time"):
-        dt = tag.get("datetime") or tag.get("content") or tag.get_text()
-        parsed = parse_date(dt)
+        parsed = parse_date(tag.get("datetime") or tag.get("content") or tag.get_text())
         if parsed:
             return parsed
-
-    # Try meta tags
-    for meta_prop in ["article:published_time", "datePublished", "date"]:
-        m = soup.find("meta", property=meta_prop) or soup.find("meta", attrs={"name": meta_prop})
+    for prop in ["article:published_time", "datePublished", "date"]:
+        m = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
         if m and m.get("content"):
             parsed = parse_date(m["content"])
             if parsed:
                 return parsed
-
-    # Try CSS selectors from source config
     for sel in date_sel.split(","):
         el = soup.select_one(sel.strip())
         if el:
             parsed = parse_date(el.get("datetime") or el.get_text())
             if parsed:
                 return parsed
-
     return None
 
 
 def is_within_cutoff(date_str: Optional[str], cutoff: datetime) -> bool:
-    """Return True if date is after the cutoff (or date is unknown)."""
+    """
+    FIX vs v3: unknown dates now FAIL the cutoff check (return False).
+    We only include articles where we can confirm the date is recent enough.
+    Exception: if cutoff is very old (backfill), we allow unknown dates through.
+    """
     if not date_str:
-        return True  # include unknown dates
+        # Allow through in backfill (cutoff is years ago), reject in daily mode
+        return cutoff < datetime.now() - timedelta(days=30)
     try:
         return datetime.strptime(date_str, "%Y-%m-%d") >= cutoff
     except:
-        return True
+        return False
 
 
-def extract_name(text: str) -> Optional[str]:
-    patterns = [
-        r'\b(?:Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Prof\.?|Chief|Alhaji|Alhaja|Pastor|Rev\.?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-        r'identified\s+as\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-        r'named\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}),?\s+(?:aged?|years?\s+old)',
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(?:was|has\s+been|were)\s+(?:arrested|detained|kidnapped|abducted|missing|nabbed|grabbed)',
-        r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:of|from)\s+(?:' + '|'.join(NIGERIAN_STATES) + ')',
-    ]
-    skip = {'The Police','The Army','The Court','The Judge','The Governor',
-            'The President','The Minister','Human Rights','Civil Society',
-            'Amnesty International','Lagos State','Federal Government',
-            'Nigerian Army','Nigerian Police'}
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            name = m.group(1).strip()
-            if name not in skip and len(name.split()) >= 2:
-                return name
-    return None
+# ── Claude extraction (replaces all regex name/entity logic) ──────────────────
+EXTRACT_PROMPT = """You are a data extraction assistant for a Nigerian human rights database.
+
+Given a news article, extract information about people who are:
+- Missing (disappeared, abducted, kidnapped, not found)
+- Arrested or detained (by police, DSS, military, EFCC, etc.)
+
+Return ONLY a JSON array. Each element is one person. If no relevant person found, return [].
+
+Fields per person:
+- full_name: string (MUST be a real human name, 2+ words, NOT a job title or organisation)
+- record_type: "missing" | "arrested"
+- age: number or null
+- gender: "male" | "female" | "unknown"
+- state: Nigerian state/city or ""
+- circumstances: 1-2 sentence summary of what happened (max 300 chars)
+- last_seen_location: where they were last seen (missing only) or ""
+- arresting_authority: who arrested them e.g. "Police", "DSS", "Army" (arrested only) or ""
+- charges: what they are charged with (arrested only) or ""
+- holding_location: where they are being held (arrested only) or ""
+
+Rules:
+- full_name must be a real person's name. Reject titles like "Press Secretary", "Central Bank", "The Governor".
+- If the article is about a group arrest with no individual names, return [].
+- Only include people clearly identified as missing or arrested/detained.
+- Do not invent information not in the article.
+
+Return raw JSON only, no markdown, no explanation."""
 
 
-def extract_age(text: str) -> Optional[int]:
-    m = re.search(r'\b(\d{1,3})[- ]?year[s]?[- ]?old\b', text, re.IGNORECASE)
-    if m:
-        age = int(m.group(1))
-        if 1 <= age <= 110:
-            return age
-    m = re.search(r'aged?\s+(\d{1,3})', text, re.IGNORECASE)
-    if m:
-        age = int(m.group(1))
-        if 1 <= age <= 110:
-            return age
-    return None
-
-
-def extract_gender(text: str) -> str:
-    t = text.lower()
-    male = sum(t.count(w) for w in [' he ',' his ',' him ',' man ',' boy ',' mr '])
-    female = sum(t.count(w) for w in [' she ',' her ',' woman ',' girl ',' mrs ',' ms '])
-    if female > male: return "female"
-    if male > female: return "male"
-    return "unknown"
-
-
-def extract_state(text: str) -> str:
-    for state in NIGERIAN_STATES:
-        if re.search(r'\b' + re.escape(state) + r'\b', text, re.IGNORECASE):
-            return state
-    return ""
-
-
-def extract_authority(text: str) -> str:
-    t = text.lower()
-    for auth in AUTHORITIES:
-        if auth in t:
-            return auth.upper() if len(auth) <= 4 else auth.title()
-    return ""
-
-
-def extract_charges(text: str) -> str:
-    for pat in [
-        r'charged\s+(?:with|for)\s+([^.]{5,80})',
-        r'accused\s+of\s+([^.]{5,80})',
-        r'count[s]?\s+of\s+([^.]{5,80})',
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()[:200]
-    return ""
-
-
-def extract_holding(text: str) -> str:
-    for pat in [
-        r'(?:held|detained|remanded|kept)\s+(?:at|in)\s+([^,.]{5,60}(?:prison|facility|station|barracks|cell|custody))',
-        r'(?:Kirikiri|Ikoyi|Kuje|Panti|Alagbon)[^,.\s]*',
-        r'(\w+\s+(?:prison|correctional|detention|remand)[^,.]{0,40})',
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(0).strip()[:150]
-    return ""
-
-
-def classify(title: str, body: str) -> Optional[str]:
-    combined = (title + " " + body[:2000]).lower()
-    a = sum(1 for kw in ARRESTED_KEYWORDS if kw.lower() in combined)
-    m = sum(1 for kw in MISSING_KEYWORDS if kw.lower() in combined)
-    if a == 0 and m == 0:
-        return None
-    return "arrested" if a >= m else "missing"
-
-
-# ── Search result pagination ──────────────────────────────────────────────────
-def get_search_urls(source: dict, query: str, cutoff: datetime, backfill: bool) -> List[str]:
-    """
-    Paginate through search results for a given query on a source.
-    Returns list of article URLs to scrape.
-    Stop paginating when we hit articles older than cutoff.
-    """
-    urls = []
-    max_pages = MAX_PAGES if backfill else 3
-
-    for page in range(1, max_pages + 1):
-        search_url = source["search"].format(
-            query=quote_plus(query),
-            page=page
+def extract_with_claude(title: str, body: str, url: str) -> List[dict]:
+    """Use Claude Haiku to extract structured person data from article text."""
+    article_text = f"HEADLINE: {title}\n\nARTICLE:\n{body[:3000]}"
+    try:
+        msg = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1000,
+            messages=[
+                {"role": "user", "content": EXTRACT_PROMPT + "\n\n" + article_text}
+            ]
         )
-        soup = fetch(search_url)
-        if not soup:
-            break
-
-        links = soup.select(source["link_sel"])
-        if not links:
-            break
-
-        page_urls = []
-        hit_old = False
-
-        for a in links:
-            href = a.get("href", "")
-            if not href:
-                continue
-            if href.startswith("/"):
-                href = source["base"] + href
-            if not href.startswith("http"):
-                continue
-            if href in urls or href == source["base"]:
-                continue
-
-            # Check date of this result if shown in listing
-            # (full date check happens when we fetch the article)
-            page_urls.append(href)
-
-        if not page_urls:
-            break
-
-        urls.extend(page_urls)
-        log.debug(f"  {source['name']} '{query}' page {page}: {len(page_urls)} links")
-
-        # Check if next page exists
-        if not backfill:
-            break
-        next_btn = soup.select_one(source.get("next_sel", "a.next"))
-        if not next_btn:
-            break
-
-        time.sleep(REQUEST_DELAY)
-
-    return list(dict.fromkeys(urls))  # deduplicate preserving order
+        raw = msg.content[0].text.strip()
+        # Strip any accidental markdown fences
+        raw = re.sub(r'^```json\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except json.JSONDecodeError as e:
+        log.debug(f"Claude JSON parse error for {url}: {e}")
+    except Exception as e:
+        log.warning(f"Claude extraction failed for {url}: {e}")
+    return []
 
 
 # ── Article scraping ──────────────────────────────────────────────────────────
-def scrape_article(url: str, source: dict, cutoff: datetime) -> Optional[ScrapedPerson]:
+def scrape_article(url: str, source: dict, cutoff: datetime) -> List[ScrapedPerson]:
     soup = fetch(url)
     if not soup:
-        return None
+        return []
 
-    # Get title
     title = ""
     for t in [soup.find("h1"), soup.find("title")]:
         if t:
             title = t.get_text(" ", strip=True)
             break
 
-    # Get body
     body = ""
     for sel in ["article", ".entry-content", ".post-content", ".article-body",
                 ".story-body", ".content", "main"]:
@@ -605,55 +418,229 @@ def scrape_article(url: str, source: dict, cutoff: datetime) -> Optional[Scraped
     if not body:
         body = soup.get_text(" ", strip=True)
 
-    # Get article date
     article_date = extract_article_date(soup, source.get("date_sel", "time"))
 
-    # Check if within cutoff
     if not is_within_cutoff(article_date, cutoff):
-        log.debug(f"  Skipping old article ({article_date}): {url}")
-        return None
+        log.debug(f"Skipping out-of-range article ({article_date}): {url}")
+        return []
 
-    # Classify
-    record_type = classify(title, body)
-    if not record_type:
-        return None
+    # Quick relevance pre-check before paying for Claude
+    combined_lower = (title + " " + body[:500]).lower()
+    relevance_words = [
+        "arrested","detained","missing","abducted","kidnapped",
+        "disappeared","remanded","custody","endsars"
+    ]
+    if not any(w in combined_lower for w in relevance_words):
+        return []
 
-    combined = title + " " + body[:3000]
-    name = extract_name(combined)
-    if not name:
-        return None
-
-    # Get photo
     photo_url = ""
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         photo_url = og["content"]
 
-    snippet = re.sub(r'\s+', ' ', body[:400]).strip()
+    extracted = extract_with_claude(title, body, url)
+    persons = []
 
-    person = ScrapedPerson(
-        full_name=name,
-        source_url=url,
-        source_name=source["name"],
-        record_type=record_type,
-        circumstances=snippet,
-        state=extract_state(combined),
-        age=extract_age(combined),
-        gender=extract_gender(combined),
-        article_date=article_date,
-        photo_url=photo_url,
-    )
+    for item in extracted:
+        name = (item.get("full_name") or "").strip()
+        if not name or len(name.split()) < 2:
+            continue
+        rtype = item.get("record_type", "")
+        if rtype not in ("missing", "arrested"):
+            continue
 
-    if record_type == "arrested":
-        person.arresting_authority = extract_authority(combined)
-        person.charges = extract_charges(combined)
-        person.holding_location = extract_holding(combined)
-    else:
-        m = re.search(r'last\s+seen\s+(?:at|in|near)?\s+([^,.]{5,60})', combined, re.IGNORECASE)
-        if m:
-            person.last_seen_location = m.group(1).strip()[:150]
+        p = ScrapedPerson(
+            full_name=name,
+            source_url=url,
+            source_name=source["name"],
+            record_type=rtype,
+            circumstances=str(item.get("circumstances", ""))[:300],
+            last_seen_location=str(item.get("last_seen_location", ""))[:150],
+            state=str(item.get("state", ""))[:50],
+            age=item.get("age") if isinstance(item.get("age"), int) else None,
+            gender=item.get("gender", "unknown"),
+            article_date=article_date,
+            photo_url=photo_url,
+            charges=str(item.get("charges", ""))[:200],
+            holding_location=str(item.get("holding_location", ""))[:150],
+            arresting_authority=str(item.get("arresting_authority", ""))[:100],
+        )
+        persons.append(p)
 
-    return person
+    return persons
+
+
+# ── Search pagination ─────────────────────────────────────────────────────────
+def get_article_urls(source: dict, query: str, backfill: bool) -> List[str]:
+    urls = []
+    max_pages = MAX_PAGES_BACK if backfill else MAX_PAGES_DAILY
+
+    for page in range(1, max_pages + 1):
+        search_url = source["search"].format(query=quote_plus(query), page=page)
+        soup = fetch(search_url)
+        if not soup:
+            break
+
+        links = soup.select(source["link_sel"])
+        if not links:
+            break
+
+        page_urls = []
+        for a in links:
+            href = a.get("href", "")
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = source["base"] + href
+            if not href.startswith("http"):
+                continue
+            if href == source["base"] or href in urls:
+                continue
+            page_urls.append(href)
+
+        if not page_urls:
+            break
+
+        urls.extend(page_urls)
+        log.debug(f"  {source['name']} '{query}' p{page}: {len(page_urls)} links")
+
+        if not backfill:
+            break
+        if not soup.select_one(source.get("next_sel", "a.next")):
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    return list(dict.fromkeys(urls))
+
+
+# ── TikTok search (via unofficial scraper endpoint) ───────────────────────────
+def search_tiktok(query: str, cutoff: datetime) -> List[ScrapedPerson]:
+    """
+    Uses TikTok's internal search API (no auth needed for public results).
+    Extracts persons from video titles and descriptions only — no video content.
+    """
+    persons = []
+    try:
+        url = f"https://www.tiktok.com/api/search/general/full/?keyword={quote_plus(query)}&offset=0&count=20"
+        headers = {
+            **HEADERS,
+            "Referer": "https://www.tiktok.com/",
+        }
+        r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        if r.status_code != 200:
+            log.debug(f"TikTok search returned {r.status_code}")
+            return []
+
+        data = r.json()
+        items = data.get("data", [])
+
+        for item in items:
+            video_info = item.get("item", {})
+            desc = video_info.get("desc", "")
+            create_time = video_info.get("createTime", 0)
+            video_id = video_info.get("id", "")
+
+            if not desc or not video_id:
+                continue
+
+            # Date check
+            if create_time:
+                article_date = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d")
+                if not is_within_cutoff(article_date, cutoff):
+                    continue
+            else:
+                article_date = None
+
+            video_url = f"https://www.tiktok.com/@{video_info.get('author', {}).get('uniqueId', 'unknown')}/video/{video_id}"
+
+            relevance_words = ["missing","arrested","detained","kidnapped","abducted","disappeared","endsars"]
+            if not any(w in desc.lower() for w in relevance_words):
+                continue
+
+            extracted = extract_with_claude(desc, desc, video_url)
+            for item_data in extracted:
+                name = (item_data.get("full_name") or "").strip()
+                if not name or len(name.split()) < 2:
+                    continue
+                rtype = item_data.get("record_type", "")
+                if rtype not in ("missing", "arrested"):
+                    continue
+                p = ScrapedPerson(
+                    full_name=name,
+                    source_url=video_url,
+                    source_name="TikTok",
+                    record_type=rtype,
+                    circumstances=str(item_data.get("circumstances", ""))[:300],
+                    state=str(item_data.get("state", ""))[:50],
+                    age=item_data.get("age") if isinstance(item_data.get("age"), int) else None,
+                    gender=item_data.get("gender", "unknown"),
+                    article_date=article_date,
+                )
+                persons.append(p)
+
+    except Exception as e:
+        log.warning(f"TikTok search failed for '{query}': {e}")
+
+    return persons
+
+
+# ── Facebook public pages ─────────────────────────────────────────────────────
+def scrape_facebook_page(page_name: str, cutoff: datetime) -> List[ScrapedPerson]:
+    """
+    Scrapes the public-facing Facebook page (mbasic.facebook.com).
+    This works without login for fully public pages.
+    Does NOT access private groups.
+    """
+    persons = []
+    url = f"https://mbasic.facebook.com/{page_name}"
+    soup = fetch(url, extra_headers={"Accept": "text/html"})
+    if not soup:
+        return []
+
+    # mbasic FB shows posts as article or div blocks
+    posts = soup.select("div[data-ft]") or soup.select("article") or []
+
+    for post in posts[:20]:  # limit to 20 most recent
+        text = post.get_text(" ", strip=True)
+        if len(text) < 30:
+            continue
+
+        relevance_words = ["missing","arrested","detained","kidnapped","abducted","disappeared","endsars"]
+        if not any(w in text.lower() for w in relevance_words):
+            continue
+
+        # Try to find post URL
+        a = post.find("a", href=re.compile(r'/story\.php|/permalink/|\?story_fbid'))
+        post_url = ""
+        if a:
+            href = a.get("href", "")
+            post_url = "https://mbasic.facebook.com" + href if href.startswith("/") else href
+
+        if not post_url:
+            post_url = url
+
+        extracted = extract_with_claude(text[:100], text, post_url)
+        for item in extracted:
+            name = (item.get("full_name") or "").strip()
+            if not name or len(name.split()) < 2:
+                continue
+            rtype = item.get("record_type", "")
+            if rtype not in ("missing", "arrested"):
+                continue
+            p = ScrapedPerson(
+                full_name=name,
+                source_url=post_url,
+                source_name=f"Facebook/{page_name}",
+                record_type=rtype,
+                circumstances=str(item.get("circumstances", ""))[:300],
+                state=str(item.get("state", ""))[:50],
+                age=item.get("age") if isinstance(item.get("age"), int) else None,
+                gender=item.get("gender", "unknown"),
+            )
+            persons.append(p)
+
+    return persons
 
 
 # ── Save to Supabase ──────────────────────────────────────────────────────────
@@ -671,7 +658,7 @@ def save_person(person: ScrapedPerson) -> bool:
                 "holding_location": person.holding_location or None,
                 "photo_url": person.photo_url or None,
                 "circumstances": person.circumstances or None,
-                "date_arrested": person.article_date,   # article date = arrest date
+                "date_arrested": person.article_date,
                 "source": "scraped",
                 "source_name": person.source_name,
                 "source_url": person.source_url,
@@ -688,7 +675,7 @@ def save_person(person: ScrapedPerson) -> bool:
                 "last_seen_location": person.last_seen_location or None,
                 "circumstances": person.circumstances or None,
                 "photo_url": person.photo_url or None,
-                "date_missing": person.article_date,    # article date = date missing reported
+                "date_missing": person.article_date,
                 "source": "scraped",
                 "source_name": person.source_name,
                 "source_url": person.source_url,
@@ -700,7 +687,10 @@ def save_person(person: ScrapedPerson) -> bool:
         log.info(f"  ✓ [{person.record_type}] {person.full_name} ({person.article_date or 'no date'}) — {person.source_name}")
         return True
     except Exception as e:
-        log.error(f"  ✗ save failed {person.full_name}: {e}")
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            log.debug(f"  Skip duplicate: {person.full_name}")
+        else:
+            log.error(f"  ✗ save failed {person.full_name}: {e}")
         return False
 
 
@@ -716,48 +706,87 @@ def run(backfill: bool = False):
     start = datetime.utcnow()
     total_saved = 0
     total_checked = 0
+    errors = 0
 
-    for source in SOURCES:
+    # ── News sources ──────────────────────────────────────────────────────────
+    for source in NEWS_SOURCES:
         log.info(f"\n── {source['name']} ──")
         source_saved = 0
+        all_candidate_urls = []
 
+        # Collect all URLs for this source first
         for query in SEARCH_TERMS:
-            log.info(f"  Searching: '{query}'")
-            article_urls = get_search_urls(source, query, cutoff, backfill)
-            log.info(f"  Found {len(article_urls)} candidate URLs")
+            urls = get_article_urls(source, query, backfill)
+            all_candidate_urls.extend(urls)
+            time.sleep(REQUEST_DELAY * 2)
 
-            for url in article_urls:
-                total_checked += 1
-                if already_scraped(url):
-                    continue
-                person = scrape_article(url, source, cutoff)
-                if person:
+        # Batch dedup — one DB call instead of one per URL
+        all_candidate_urls = list(dict.fromkeys(all_candidate_urls))
+        new_urls = filter_already_scraped(all_candidate_urls)
+        log.info(f"  {len(all_candidate_urls)} candidates → {len(new_urls)} new after dedup")
+
+        for url in new_urls:
+            total_checked += 1
+            try:
+                persons = scrape_article(url, source, cutoff)
+                for person in persons:
                     if save_person(person):
                         source_saved += 1
                         total_saved += 1
-                time.sleep(REQUEST_DELAY)
+            except Exception as e:
+                log.error(f"  Error on {url}: {e}")
+                errors += 1
+            time.sleep(REQUEST_DELAY)
 
-            time.sleep(REQUEST_DELAY * 2)  # pause between search terms
+        log.info(f"  → {source['name']}: {source_saved} records saved")
+        time.sleep(2)
 
-        log.info(f"  → {source['name']}: {source_saved} new records saved")
-        time.sleep(2)  # pause between sources
+    # ── TikTok ────────────────────────────────────────────────────────────────
+    log.info("\n── TikTok ──")
+    tiktok_terms = [
+        "missing person Nigeria",
+        "arrested Nigeria activist",
+        "EndSARS missing",
+        "kidnapped Nigeria",
+    ]
+    tiktok_urls_seen = set()
+    for term in tiktok_terms:
+        persons = search_tiktok(term, cutoff)
+        for p in persons:
+            if p.source_url not in tiktok_urls_seen:
+                tiktok_urls_seen.add(p.source_url)
+                if save_person(p):
+                    total_saved += 1
+        time.sleep(REQUEST_DELAY * 2)
 
+    # ── Facebook public pages ─────────────────────────────────────────────────
+    log.info("\n── Facebook Public Pages ──")
+    fb_urls_seen = set()
+    for page_name in FACEBOOK_PAGES:
+        log.info(f"  Scraping fb/{page_name}")
+        persons = scrape_facebook_page(page_name, cutoff)
+        for p in persons:
+            if p.source_url not in fb_urls_seen:
+                fb_urls_seen.add(p.source_url)
+                if save_person(p):
+                    total_saved += 1
+        time.sleep(REQUEST_DELAY * 3)
+
+    # ── Log run ───────────────────────────────────────────────────────────────
     duration = (datetime.utcnow() - start).seconds
-
-    # Log run
     try:
         supabase.table("scraper_runs").insert({
             "started_at": start.isoformat(),
             "duration_seconds": duration,
-            "sources_checked": len(SOURCES),
+            "sources_checked": len(NEWS_SOURCES) + len(FACEBOOK_PAGES) + 1,
             "records_found": total_saved,
-            "errors": 0,
+            "errors": errors,
             "status": "success",
         }).execute()
     except Exception as e:
         log.error(f"Could not log run: {e}")
 
-    log.info(f"\n=== Done. {total_saved} saved from {total_checked} checked in {duration}s ===")
+    log.info(f"\n=== Done. {total_saved} saved / {total_checked} checked / {duration}s ===")
 
 
 if __name__ == "__main__":
