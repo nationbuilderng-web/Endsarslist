@@ -16,6 +16,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S"
 )
 
+def scrape_data():
+    """Fetch all records from the Supabase victims table."""
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    response = supabase.table('victims').select('*').execute()
+    return response.data
+
 def dump_json(data, filename="data/endsars_list.json"):
     Path("data").mkdir(exist_ok=True)
     with open(filename, 'w') as f:
@@ -23,7 +29,7 @@ def dump_json(data, filename="data/endsars_list.json"):
 
 def run_scraper():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    victims_list = scrape_data()  # Assume this exists
+    victims_list = scrape_data()
 
     try:
         for record in victims_list:
@@ -36,7 +42,6 @@ def run_scraper():
                     str(e)
                 )
     finally:
-        # Always dump the full list of scraped data as a reliable artifact
         dump_json(victims_list)
 
 if __name__ == "__main__":
