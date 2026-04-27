@@ -25,7 +25,7 @@ import os, re, time, logging, sys, argparse, json
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urlparse
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -133,7 +133,7 @@ SEARCH_QUERIES = [
     "arrested Benin City",
     "kidnapped Benin City",
 
-    # â”€â”€ Kaduna â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Kaduna â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "taken Kaduna",
     "missing person Kaduna",
     "arrested Kaduna",
@@ -157,7 +157,7 @@ SEARCH_QUERIES = [
     "arrested Maiduguri",
     "kidnapped Maiduguri",
 
-    # â”€â”€ States â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ States â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "arrested Rivers State",
     "kidnapped Rivers State",
     "missing Rivers State",
@@ -304,24 +304,27 @@ def fetch_xml(url: str) -> Optional[BeautifulSoup]:
         return None
 
 
-# â”€â”€ Google News RSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Bing News RSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_domain(url: str) -> str:
     """Extract domain from URL."""
     m = re.search(r'https?://(?:www\.)?([^/]+)', url)
     return m.group(1).lower() if m else ""
 
 
-def google_news_urls(query: str, cutoff: datetime) -> List[tuple]:
+def resolve_bing_link(url: str) -> str:
+    """Extract the publisher URL from Bing's tracking redirect."""
+    parsed = urlparse(url)
+    if "bing.com" not in parsed.netloc:
+        return url
+    return parse_qs(parsed.query).get("url", [""])[0] or url
+
+
+def bing_news_urls(query: str, cutoff: datetime) -> List[tuple]:
     """
-    Query Google News RSS for a search term.
+    Query Bing News RSS for a search term.
     Returns list of (url, pub_date, source_name) tuples.
-    Google News RSS: https://news.google.com/rss/search?q=QUERY&hl=en-NG&gl=NG&ceid=NG:en
     """
-    rss_url = (
-        f"https://news.google.com/rss/search?"
-        f"q={quote_plus(query)}"
-        f"&hl=en-NG&gl=NG&ceid=NG:en"
-    )
+    rss_url = f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss"
 
     soup = fetch_xml(rss_url)
     if not soup:
@@ -329,41 +332,10 @@ def google_news_urls(query: str, cutoff: datetime) -> List[tuple]:
 
     results = []
     for item in soup.find_all("item"):
-        # In Google News RSS, <link> is a self-closing tag in XML mode.
-        # The actual URL is stored as the text of <guid> or as the
-        # NavigableString sibling of <link>. Try multiple approaches.
-        url = ""
-
-        # Approach 1: guid contains the Google News article URL
-        guid = item.find("guid")
-        if guid:
-            url = guid.get_text().strip()
-
-        # Approach 2: link tag text (works in some parsers)
-        if not url:
-            link = item.find("link")
-            if link and link.string:
-                url = link.string.strip()
-
-        # Approach 3: next sibling of <link> tag (BeautifulSoup XML quirk)
-        if not url:
-            link = item.find("link")
-            if link and link.next_sibling:
-                candidate = str(link.next_sibling).strip()
-                if candidate.startswith("http"):
-                    url = candidate
-
+        link = item.find("link")
+        url = resolve_bing_link(link.get_text().strip()) if link else ""
         if not url:
             continue
-
-        # Follow Google redirect to get the real article URL
-        if "google.com" in url:
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                allow_redirects=True)
-                url = r.url
-            except:
-                continue
 
         # Check domain is trusted
         domain = get_domain(url)
@@ -388,7 +360,7 @@ def google_news_urls(query: str, cutoff: datetime) -> List[tuple]:
             continue
 
         # Get source name
-        source_tag = item.find("source")
+        source_tag = item.find("News:Source") or item.find("source")
         source_name = source_tag.get_text().strip() if source_tag else domain
 
         results.append((url, pub_date, source_name))
@@ -619,7 +591,7 @@ def save_person(person: ScrapedPerson) -> bool:
         return False
 
 
-# â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def run(backfill: bool = False):
     if backfill:
         cutoff = datetime.now() - timedelta(days=365 * BACKFILL_YEARS)
@@ -632,13 +604,13 @@ def run(backfill: bool = False):
     total_saved = 0
     total_checked = 0
 
-    # â”€â”€ Collect all article URLs via Google News RSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Collect all article URLs via Bing News RSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     all_articles = {}  # url -> (pub_date, source_name)
 
-    log.info(f"\nâ”€â”€ Querying Google News RSS ({len(SEARCH_QUERIES)} queries) â”€â”€")
+    log.info(f"\nâ”€â”€ Querying Bing News RSS ({len(SEARCH_QUERIES)} queries) â”€â”€")
     for query in SEARCH_QUERIES:
         log.info(f"  Searching: '{query}'")
-        results = google_news_urls(query, cutoff)
+        results = bing_news_urls(query, cutoff)
         log.info(f"  Found {len(results)} results")
         for url, pub_date, source_name in results:
             if url not in all_articles:
