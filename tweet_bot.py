@@ -18,11 +18,17 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://endsarslist-api.damidude.workers.dev").rstrip("/")
+
+def clean_env(name: str, default: str = "") -> str:
+    value = os.environ.get(name, default)
+    return value.strip() if isinstance(value, str) else default
+
+
+API_BASE_URL = clean_env("API_BASE_URL", "https://endsarslist-api.damidude.workers.dev").rstrip("/")
 ADMIN_API_TOKEN = (
-    os.environ.get("D1_ADMIN_TOKEN")
-    or os.environ.get("SUPABASE_SERVICE_KEY")
-    or os.environ.get("SUPABASE_KEY")
+    clean_env("D1_ADMIN_TOKEN")
+    or clean_env("SUPABASE_SERVICE_KEY")
+    or clean_env("SUPABASE_KEY")
 )
 API_HEADERS = {"x-admin-token": ADMIN_API_TOKEN or ""}
 
