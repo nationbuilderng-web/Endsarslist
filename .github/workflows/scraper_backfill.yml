@@ -1,6 +1,9 @@
 name: Backfill Scraper
  
 on:
+  push:
+    paths:
+      - '.github/workflow-triggers/scraper_backfill.trigger'
   workflow_dispatch:
  
 jobs:
