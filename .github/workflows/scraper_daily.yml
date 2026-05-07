@@ -29,16 +29,16 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml python-dotenv anthropic
+        run: pip install requests beautifulsoup4 lxml python-dotenv
 
       - name: Run scraper
         env:
           D1_ADMIN_TOKEN: ${{ secrets.D1_ADMIN_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           API_BASE_URL: https://endsarslist-api.damidude.workers.dev
         run: |
           if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
-            python scraper_v5.py --backfill
+            python scraper_v6.py --backfill
           else
-            python scraper_v5.py
+            python scraper_v6.py
           fi
