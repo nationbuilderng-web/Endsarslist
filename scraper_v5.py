@@ -20,7 +20,6 @@ from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote_plus, urlparse, urlunparse
 
-import anthropic
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -41,14 +40,14 @@ ADMIN_API_TOKEN = (
     or clean_env("SUPABASE_SERVICE_KEY")
     or clean_env("SUPABASE_KEY")
 )
-claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+OPENAI_API_KEY = clean_env("OPENAI_API_KEY")
 
 
 BACKFILL_YEARS = 10
 DAILY_DAYS = 2
 REQUEST_DELAY = 1.5
 TIMEOUT = 20
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+OPENAI_MODEL = clean_env("OPENAI_MODEL", "gpt-4o-2024-08-06")
 ARTICLE_TEXT_LIMIT = 3000
 BACKFILL_TEXT_LIMIT = 6000
 BACKFILL_MAX_SITEMAPS = 40
@@ -67,6 +66,49 @@ HEADERS = {
 API_HEADERS = {
     "Content-Type": "application/json",
     "x-admin-token": ADMIN_API_TOKEN or "",
+}
+
+OPENAI_EXTRACTION_SCHEMA = {
+    "name": "endsars_people",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "people": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "full_name": {"type": "string"},
+                        "record_type": {"type": "string", "enum": ["missing", "arrested"]},
+                        "age": {"type": ["integer", "null"]},
+                        "gender": {"type": "string", "enum": ["male", "female", "unknown"]},
+                        "state": {"type": "string"},
+                        "circumstances": {"type": "string"},
+                        "last_seen_location": {"type": "string"},
+                        "arresting_authority": {"type": "string"},
+                        "charges": {"type": "string"},
+                        "holding_location": {"type": "string"},
+                    },
+                    "required": [
+                        "full_name",
+                        "record_type",
+                        "age",
+                        "gender",
+                        "state",
+                        "circumstances",
+                        "last_seen_location",
+                        "arresting_authority",
+                        "charges",
+                        "holding_location",
+                    ],
+                },
+            }
+        },
+        "required": ["people"],
+    },
 }
 
 RELEVANCE_WORDS = [
@@ -604,9 +646,17 @@ def should_keep_name(name: str) -> bool:
     }
     if lowered in banned:
         return False
-    if len(name.split()) >= 2:
-        return True
-    return lowered.startswith(("unknown ", "unidentified "))
+    if lowered.startswith((
+        "unknown ",
+        "unidentified ",
+        "unnamed ",
+        "yet-to-be-identified ",
+        "unyet-identified ",
+    )):
+        return False
+    if re.search(r"\b(suspect|victim|driver|passenger|resident|man|woman|boy|girl|person)\b", lowered):
+        return False
+    return len(name.split()) >= 2
 
 
 EXTRACT_PROMPT = """You are a data extraction assistant for a Nigerian human rights database tracking victims of police brutality, government repression, and the EndSARS movement.
@@ -615,28 +665,29 @@ Given a news article, extract information about people who are:
 - Missing (disappeared, abducted, kidnapped, not found, whereabouts unknown)
 - Arrested or detained (by police, DSS, military, EFCC, or any authority)
 
-Return ONLY a JSON array. Each element is one person. If no relevant person found, return [].
+Return ONLY valid JSON matching the schema. If no relevant person found, return {"people":[]}.
 
 Fields per person:
-- full_name: string (prefer a real human name. If the article clearly identifies one singular person without a full name, you may keep a specific identifier like \"Unknown Female Victim\" or \"Unknown Driver\")
-- record_type: \"missing\" | \"arrested\"
+- full_name: string (must be a real human name with at least 2 words)
+- record_type: "missing" | "arrested"
 - age: number or null
-- gender: \"male\" | \"female\" | \"unknown\"
-- state: Nigerian state or city name, or \"\"
+- gender: "male" | "female" | "unknown"
+- state: Nigerian state or city name, or ""
 - circumstances: 1-2 sentence summary of what happened (max 300 chars)
-- last_seen_location: where last seen (for missing persons) or \"\"
-- arresting_authority: e.g. \"Police\", \"DSS\", \"Army\", \"EFCC\" (for arrested) or \"\"
-- charges: what charged with (for arrested) or \"\"
-- holding_location: where being held (for arrested) or \"\"
+- last_seen_location: where last seen (for missing persons) or ""
+- arresting_authority: e.g. "Police", "DSS", "Army", "EFCC" (for arrested) or ""
+- charges: what charged with (for arrested) or ""
+- holding_location: where being held (for arrested) or ""
 
 Rules:
-- REJECT job titles, organisations, agencies, or places as names: \"Press Secretary\", \"Central Bank\", \"The Governor\", \"Police Officer\"
+- REJECT job titles, organisations, agencies, or places as names: "Press Secretary", "Central Bank", "The Governor", "Police Officer"
 - If only a group is mentioned with no individual names, return []
 - Only include people clearly identified as missing or arrested/detained
-- Include suspects, victims, detainees, kidnapped people, rescued kidnap victims, and remanded defendants if they are clearly individual people
+- Include suspects, victims, detainees, kidnapped people, rescued kidnap victims, and remanded defendants if they are clearly named individual people
+- If a person is unnamed or only described as "unknown", "unidentified", "victim", or "suspect", do not include them
 - Do not invent or assume information not stated in the article
 
-Return raw JSON array only. No markdown, no explanation, no preamble."""
+Return raw JSON only. No markdown, no explanation, no preamble."""
 
 EXTRACT_PROMPT_RETRY = """You are doing a second-pass extraction for a Nigerian missing-persons and detention tracker.
 
@@ -646,31 +697,63 @@ Extract EVERY clearly identified individual in the article who is:
 
 Be less conservative than usual:
 - include names that appear in body paragraphs even if not highlighted in the headline
-- include singular placeholders like \"Unknown Female Victim\", \"Unknown Driver\", or \"Unidentified Man\" if the article clearly refers to one person
 - include suspects and defendants if the story says they were arrested, remanded, or detained
+- still require real names with at least 2 words
+- reject placeholders like "Unknown Suspect", "Unknown Female Victim", "Unidentified Man", "Driver", or "Passenger"
 
-Return raw JSON array only using the same schema as before:
-full_name, record_type, age, gender, state, circumstances, last_seen_location, arresting_authority, charges, holding_location"""
+Return raw JSON only using the same schema as before, wrapped as {"people":[...]}."""
 
 
-def extract_with_claude(title: str, body: str, url: str, prompt: str, text_limit: int) -> List[dict]:
+def extract_openai_output_text(payload: dict) -> str:
+    texts: List[str] = []
+    for item in payload.get("output", []) or []:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []) or []:
+            if content.get("type") == "output_text" and content.get("text"):
+                texts.append(content["text"])
+    return "\n".join(texts).strip()
+
+
+def extract_with_gpt(title: str, body: str, url: str, prompt: str, text_limit: int) -> List[dict]:
+    if not OPENAI_API_KEY:
+        log.warning("GPT extraction skipped: OPENAI_API_KEY is missing")
+        return []
     article_text = f"HEADLINE: {title}\n\nARTICLE:\n{body[:text_limit]}"
     try:
-        msg = claude.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1200,
-            messages=[{"role": "user", "content": prompt + "\n\n" + article_text}],
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "input": prompt + "\n\n" + article_text,
+                "max_output_tokens": 1400,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": OPENAI_EXTRACTION_SCHEMA["name"],
+                        "schema": OPENAI_EXTRACTION_SCHEMA["schema"],
+                        "strict": OPENAI_EXTRACTION_SCHEMA["strict"],
+                    }
+                },
+            },
+            timeout=TIMEOUT,
         )
-        raw = msg.content[0].text.strip()
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        response.raise_for_status()
+        payload = response.json()
+        raw = extract_openai_output_text(payload)
+        if not raw:
+            return []
         data = json.loads(raw)
-        if isinstance(data, list):
-            return data
+        if isinstance(data, dict) and isinstance(data.get("people"), list):
+            return data["people"]
     except json.JSONDecodeError as e:
-        log.debug(f"Claude JSON parse error for {url}: {e}")
+        log.debug(f"GPT JSON parse error for {url}: {e}")
     except Exception as e:
-        log.warning(f"Claude extraction failed for {url}: {e}")
+        log.warning(f"GPT extraction failed for {url}: {e}")
     return []
 
 
@@ -725,8 +808,8 @@ def scrape_article(url: str, source_name: str, pub_date: Optional[datetime], bac
         photo_url = og_image["content"]
 
     text_limit = BACKFILL_TEXT_LIMIT if backfill else ARTICLE_TEXT_LIMIT
-    extracted = extract_with_claude(title, body, url, EXTRACT_PROMPT, text_limit)
-    retry_extracted = extract_with_claude(title, body, url, EXTRACT_PROMPT_RETRY, text_limit) if (backfill or len(extracted) <= 1) else []
+    extracted = extract_with_gpt(title, body, url, EXTRACT_PROMPT, text_limit)
+    retry_extracted = extract_with_gpt(title, body, url, EXTRACT_PROMPT_RETRY, text_limit) if (backfill or len(extracted) <= 1) else []
 
     persons = []
     seen_people = set()
