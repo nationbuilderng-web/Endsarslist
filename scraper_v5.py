@@ -395,6 +395,7 @@ def is_trusted_domain(url: str) -> bool:
 def normalize_source_url(url: str) -> str:
     parsed = urlparse(url.strip())
     query = parse_qs(parsed.query)
+    keep = []
     if "url" in query and "bing.com" in parsed.netloc:
         return normalize_source_url(query["url"][0])
     clean_parsed = parsed._replace(
@@ -639,12 +640,32 @@ def should_keep_name(name: str) -> bool:
     if not name:
         return False
     lowered = name.lower()
+    if "[" in lowered or "]" in lowered:
+        return False
     banned = {
         "press secretary", "central bank", "the governor", "police officer",
         "spokesperson", "security operative", "kidnappers", "suspects",
         "victim", "unknown victim", "passenger", "resident", "driver",
+        "john doe", "jane smith", "placeholder name",
     }
+    banned_phrases = (
+        "okonjo-iweala refutes",
+        "oborevwori flags",
+        "kwara apc chairman",
+        "governor alia",
+        "owode onirin",
+        "borno women",
+        "orphanage children",
+        "five workers",
+        "six suspected homosexuals",
+        "hunter remanded",
+        "tegbe as",
+        "power minister",
+        "detained nigerian tourists",
+    )
     if lowered in banned:
+        return False
+    if any(phrase in lowered for phrase in banned_phrases):
         return False
     if lowered.startswith((
         "unknown ",
@@ -654,7 +675,9 @@ def should_keep_name(name: str) -> bool:
         "unyet-identified ",
     )):
         return False
-    if re.search(r"\b(suspect|victim|driver|passenger|resident|man|woman|boy|girl|person)\b", lowered):
+    if re.search(r"\b(suspect|victim|driver|passenger|resident|man|woman|boy|girl|person|workers|women|children|tourists)\b", lowered):
+        return False
+    if re.search(r"\b(chairman|governor|flags|refutes|remanded|detained)\b", lowered):
         return False
     return len(name.split()) >= 2
 
@@ -701,7 +724,7 @@ Be less conservative than usual:
 - still require real names with at least 2 words
 - reject placeholders like "Unknown Suspect", "Unknown Female Victim", "Unidentified Man", "Driver", or "Passenger"
 
-Return raw JSON only using the same schema as before, wrapped as {"people":[...]}."""
+Return raw JSON only using the same schema as before, wrapped as {"people":[...]}"""
 
 
 def extract_openai_output_text(payload: dict) -> str:
