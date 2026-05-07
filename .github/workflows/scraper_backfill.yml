@@ -23,7 +23,7 @@ jobs:
       - name: Run backfill scraper
         env:
           D1_ADMIN_TOKEN: ${{ secrets.D1_ADMIN_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.ENDSARSLISTOPENAISECRET }}
           API_BASE_URL: https://endsarslist-api.damidude.workers.dev
         run: python scraper_v6.py --backfill
  
