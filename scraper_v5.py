@@ -636,6 +636,43 @@ def normalize_name(name: str) -> str:
     return normalize_whitespace(name).replace(" ,", ",")
 
 
+def person_key(record_type: str, name: str, state: str, article_date: Optional[str]) -> Tuple[str, str, str, str]:
+    return (
+        record_type,
+        normalize_name(name).lower(),
+        normalize_whitespace(state).lower(),
+        article_date or "",
+    )
+
+
+def load_existing_person_keys() -> Set[Tuple[str, str, str, str]]:
+    seen: Set[Tuple[str, str, str, str]] = set()
+    endpoints = [
+        ("missing", f"{API_BASE_URL}/api/missing_persons?approved=true&limit=5000", "date_missing"),
+        ("arrested", f"{API_BASE_URL}/api/arrested_persons?approved=true&limit=5000", "date_arrested"),
+    ]
+    for record_type, url, date_field in endpoints:
+        try:
+            response = requests.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            rows = response.json() or []
+            if isinstance(rows, dict):
+                rows = rows.get("records") or rows.get("results") or []
+            for row in rows:
+                seen.add(
+                    person_key(
+                        record_type,
+                        str(row.get("full_name", "")),
+                        str(row.get("state", "")),
+                        row.get(date_field),
+                    )
+                )
+        except Exception as e:
+            log.warning(f"Existing-record dedupe load failed for {record_type}: {e}")
+    log.info(f"-- Existing person fingerprints loaded: {len(seen)} --")
+    return seen
+
+
 def should_keep_name(name: str) -> bool:
     if not name:
         return False
@@ -678,6 +715,15 @@ def should_keep_name(name: str) -> bool:
     if re.search(r"\b(suspect|victim|driver|passenger|resident|man|woman|boy|girl|person|workers|women|children|tourists)\b", lowered):
         return False
     if re.search(r"\b(chairman|governor|flags|refutes|remanded|detained)\b", lowered):
+        return False
+    if re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", lowered):
+        return False
+    tokens = [token.strip(".,:;!?()[]{}'\"") for token in name.split() if token.strip(".,:;!?()[]{}'\"")]
+    if len(tokens) < 2 or len(tokens) > 5:
+        return False
+    if sum(1 for token in tokens if token.isupper() and len(token) > 1) > 2:
+        return False
+    if any(token and token[0].islower() for token in tokens):
         return False
     return len(name.split()) >= 2
 
@@ -799,7 +845,13 @@ def extract_article_date(soup: BeautifulSoup, pub_date: Optional[datetime]) -> O
     return None
 
 
-def scrape_article(url: str, source_name: str, pub_date: Optional[datetime], backfill: bool) -> List[ScrapedPerson]:
+def scrape_article(
+    url: str,
+    source_name: str,
+    pub_date: Optional[datetime],
+    backfill: bool,
+    existing_keys: Set[Tuple[str, str, str, str]],
+) -> List[ScrapedPerson]:
     soup = fetch(url)
     if not soup:
         return []
@@ -843,15 +895,15 @@ def scrape_article(url: str, source_name: str, pub_date: Optional[datetime], bac
         record_type = item.get("record_type", "")
         if record_type not in ("missing", "arrested"):
             continue
-        person_key = (
+        dedupe_key = person_key(
             record_type,
-            name.lower(),
-            normalize_whitespace(str(item.get("state", ""))).lower(),
-            article_date or "",
+            name,
+            str(item.get("state", "")),
+            article_date,
         )
-        if person_key in seen_people:
+        if dedupe_key in seen_people or dedupe_key in existing_keys:
             continue
-        seen_people.add(person_key)
+        seen_people.add(dedupe_key)
         person = ScrapedPerson(
             full_name=name,
             source_url=url,
@@ -973,14 +1025,16 @@ def run(backfill: bool = False):
     all_urls = list(all_articles.keys())
     new_urls = filter_already_scraped(all_urls)
     log.info(f"-- After dedup: {len(new_urls)} new articles to process --\n")
+    existing_keys = load_existing_person_keys()
 
     for url in new_urls:
         total_checked += 1
         pub_date, source_name = all_articles[url]
         try:
-            persons = scrape_article(url, source_name, pub_date, backfill)
+            persons = scrape_article(url, source_name, pub_date, backfill, existing_keys)
             for person in persons:
                 if save_person(person):
+                    existing_keys.add(person_key(person.record_type, person.full_name, person.state, person.article_date))
                     total_saved += 1
         except Exception as e:
             log.error(f"Error on {url}: {e}")
